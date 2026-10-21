@@ -84,6 +84,8 @@ private:
         uint32_t entryCount;
     };
 
+    static constexpr uint8_t GLYPH_FLAG_SDF_ONLY = 1; // the pixels are a plain SDF; refine to MSDF when drawn large
+
     struct alignas(64) GlyphEntry {
         uint32_t codepoint;
         uint16_t width;
@@ -92,6 +94,7 @@ private:
         FT_Int bitmapLeft;
         uint32_t dataOffset;
         uint32_t dataSize;
+        uint8_t flags;      // GLYPH_FLAG_*; old caches have 0 here (= a real MSDF)
 
         bool operator<(const GlyphEntry& other) const {
             return codepoint < other.codepoint;

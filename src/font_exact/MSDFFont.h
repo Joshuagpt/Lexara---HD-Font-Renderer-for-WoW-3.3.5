@@ -35,10 +35,12 @@ private:
         uint32_t codepoint = 0;
         int sdfW = 0, sdfH = 0;
         FT_Int bitmapLeft = 0, bitmapTop = 0;
+        bool refine = false; // an MSDF for a glyph that is already drawn from a plain SDF
     };
     struct GenResult {
         GenJob job;
         bool ok = false;
+        bool msdf = false;   // the pixels are a real MSDF (false = plain SDF)
         bool stored = false; // already handed to the disk cache
         double ms = 0.0;
         std::vector<uint8_t> pixels;
@@ -47,6 +49,7 @@ private:
         std::mutex mtx;
         std::condition_variable cv;
         std::deque<GenJob> jobs;
+        std::deque<GenJob> refineJobs; // MSDF refinements: taken only when `jobs` is empty
         std::vector<GenResult> results;
         std::atomic<bool> hasResults{ false };
         bool stop = false;
@@ -67,6 +70,11 @@ public:
 
     // preferSync=true: generate on the render thread (used for 3D nameplates so text does not wait on workers).
     const GlyphMetrics* GetGlyph(uint32_t codepoint, bool preferSync = false);
+
+    // Glyphs are first made as plain SDFs (~0.2 ms for a hanzi). When a string draws one larger than
+    // MSDF::MSDF_ABOVE_SCALE x SDF_RENDER_SIZE, this asks a worker for the real MSDF; it replaces the SDF in the
+    // atlas cell in place when it arrives (same UVs, no string has to be rebuilt).
+    void RequestRefinement(uint32_t codepoint);
 
     static MSDFFont* Get(FT_Face face);
     static void Register(FT_Face face, const FT_Byte* data, FT_Long size);
@@ -99,6 +107,10 @@ private:
     void EvictTile(uint32_t tile);
     bool UploadGlyphToAtlas(GlyphMetrics& metrics, uint32_t codepoint);
     bool GenerateMSDF(std::vector<uint8_t>& outData, uint32_t codepoint, int sdfW, int sdfH) const;
+    // Plain SDF from FreeType's coverage + an exact distance transform. Same cell, same encoding as the MSDF.
+    // Transforms slot->outline in place. Thread-safe as long as the slot belongs to the calling thread's face.
+    static bool GenerateSDF(FT_GlyphSlot slot, std::vector<uint8_t>& outData, int sdfW, int sdfH);
+    void ApplyRefinement(GenResult& r);
     // Thread-safe core of GenerateMSDF: only touches the given font handle and thread-local buffers.
     static bool GenerateMSDFWith(msdfgen::FontHandle* font, std::vector<uint8_t>& outData, uint32_t codepoint, int sdfW, int sdfH);
 
@@ -119,6 +131,8 @@ private:
     std::vector<std::thread> m_genThreads;
     ankerl::unordered_dense::map<uint32_t, GenResult> m_done; // finished by a worker, waiting for an atlas upload (render thread only)
     std::unordered_set<uint32_t> m_inflight;                  // queued or being generated (render thread only)
+    std::unordered_set<uint32_t> m_refineInflight;            // MSDF refinement requested, not yet applied
+    std::unordered_set<uint32_t> m_refineFailed;              // refinement failed: do not ask again
     msdfgen::FontHandle* m_msdfFont;
     bool m_isValid;
 	uint32_t m_evictionCount;

@@ -241,6 +241,13 @@ namespace {
                 if (!entry) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 2; } continue; }
                 if (gm->atlasTile != 0xFF) tileMask |= 1u << gm->atlasTile;
 
+                // Glyphs start as plain SDFs, which round sharp corners when drawn larger than the cell's render size.
+                // 2D text drawn that large asks for the real MSDF; it replaces the SDF in the atlas in place.
+                // (3D text is left out: its size on screen is not known here.)
+                if (!is3d && scale > MSDF::MSDF_ABOVE_SCALE && !gm->msdf && gm->width > 0) {
+                    fontHandle->RequestRefinement(codepoint);
+                }
+
                 CGxFontVertex* vert0 = &vBase[0];
                 CGxFontVertex* vert1 = &vBase[1];
                 CGxFontVertex* vert2 = &vBase[2];

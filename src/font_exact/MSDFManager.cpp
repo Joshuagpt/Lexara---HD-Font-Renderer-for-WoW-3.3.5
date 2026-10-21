@@ -211,6 +211,7 @@ bool MSDFManager::LoadGlyph(const MSDFCache::BlockWrap& wrap, uint32_t codepoint
     outMetrics.bitmapTop = ge.bitmapTop;
     outMetrics.bitmapLeft = ge.bitmapLeft;
     outMetrics.pixelData = ge.dataSize > 0 ? blockPtr->payload + ge.dataOffset : nullptr;
+    outMetrics.msdf = (ge.flags & MSDFCache::GLYPH_FLAG_SDF_ONLY) == 0;
 
     return true;
 }

@@ -18,6 +18,9 @@ struct GlyphMetrics {
     float u0 = 0.0f, v0 = 0.0f, u1 = 0.0f, v1 = 0.0f;
     uint16_t atlasPageIndex = 0;
     uint8_t atlasTile = 0xFF; // tile inside the atlas (0xFF = none, e.g. blank glyphs)
+    // false = the pixels are a plain SDF (fast to make); true = a real MSDF (or unknown, e.g. made by an older build).
+    // A glyph drawn larger than MSDF_ABOVE_SCALE x SDF_RENDER_SIZE is refined from SDF to MSDF in the background.
+    bool msdf = true;
     const uint8_t* pixelData = nullptr;
 };
 
@@ -29,6 +32,7 @@ struct GlyphMetricsToStore {
 	FT_Int bitmapLeft = 0;
     std::vector<uint8_t> ownedPixelData;
     uint32_t dataSize = 0;
+    bool msdf = true; // false = plain SDF (stored with a flag in the disk cache)
 };
 
 class MSDFCache;
@@ -50,6 +54,10 @@ namespace MSDF {
 
 	inline FT_Library g_realFtLibrary = nullptr;
 	inline msdfgen::FreetypeHandle* g_msdfFreetype = nullptr;
+
+    // A plain SDF matches an MSDF up to about the render size of the cell and rounds sharp corners beyond it.
+    // 2D text drawn larger than this factor of SDF_RENDER_SIZE gets its glyphs refined to MSDF.
+    inline constexpr double MSDF_ABOVE_SCALE = 1.0;
 
     inline constexpr uint32_t MAX_ATLAS_PAGES = 4;
     inline constexpr size_t CJK_CACHE_THRESHOLD = 16661;

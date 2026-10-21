@@ -4,6 +4,8 @@
 #include "MSDFValidator.h"
 #include "MSDFUtils.h"
 #include <ranges>
+#include <cmath>
+#include <algorithm>
 
 MSDFFont::MSDFFont(FT_Face face, const FT_Byte* fontData, FT_Long dataSize)
     : m_ftFace(face), m_msdfFont(nullptr), m_isValid(false), m_evictionCount(0)
@@ -88,6 +90,8 @@ void MSDFFont::FlushPendingEvictions() {
         if (!handle) continue;
         handle->m_tiles.SetClock(++handle->m_clock);
         if (handle->m_evictionPending) handle->ExecutePendingEviction();
+        // Pick up finished background work every batch, so an MSDF refinement is applied even while no new glyph is requested.
+        if (handle->m_asyncGen) handle->DrainGenResults();
     }
 }
 
@@ -240,6 +244,8 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint, bool preferSync) {
                 storage.height = static_cast<uint16_t>(res.job.sdfH);
                 storage.ownedPixelData = std::move(res.pixels);
                 storage.dataSize = static_cast<uint32_t>(storage.ownedPixelData.size());
+                storage.msdf = res.msdf;
+                metrics.msdf = res.msdf;
                 metrics.width = storage.width;
                 metrics.height = storage.height;
                 metrics.bitmapLeft = storage.bitmapLeft;
@@ -325,7 +331,13 @@ const GlyphMetrics* MSDFFont::GetGlyph(uint32_t codepoint, bool preferSync) {
                 }
 
                 storage.ownedPixelData.reserve(static_cast<size_t>(sdfW) * sdfH * 4);
-                if (GenerateMSDF(storage.ownedPixelData, codepoint, sdfW, sdfH)) {
+                // A plain SDF first: ~0.2 ms for a hanzi, against 30-50 ms for the MSDF. The MSDF is only a
+                // fallback here; glyphs drawn large are refined to MSDF later (RequestRefinement).
+                const bool madeSdf = GenerateSDF(m_ftFace->glyph, storage.ownedPixelData, sdfW, sdfH);
+                if (!madeSdf) storage.ownedPixelData.clear();
+                if (madeSdf || GenerateMSDF(storage.ownedPixelData, codepoint, sdfW, sdfH)) {
+                    storage.msdf = !madeSdf;
+                    metrics.msdf = !madeSdf;
                     storage.width = sdfW;
                     storage.height = sdfH;
                     storage.dataSize = static_cast<uint32_t>(storage.ownedPixelData.size());
@@ -421,6 +433,10 @@ void MSDFFont::DrainGenResults() {
         m_gen->hasResults.store(false, std::memory_order_relaxed);
     }
     for (GenResult& r : local) {
+        if (r.job.refine) {
+            ApplyRefinement(r);
+            continue;
+        }
         m_inflight.erase(r.job.codepoint);
         const uint32_t cp = r.job.codepoint;
         m_done[cp] = std::move(r);
@@ -430,25 +446,59 @@ void MSDFFont::DrainGenResults() {
 void MSDFFont::GenWorkerMain(std::shared_ptr<GenState> st) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
-    // Every worker owns its FreeType library and font face: msdfgen/FreeType objects are not shared across threads.
-    msdfgen::FreetypeHandle* ft = msdfgen::initializeFreetype();
-    msdfgen::FontHandle* font = ft ? msdfgen::loadFontData(ft, st->data, st->size) : nullptr;
+    // Every worker owns its FreeType library and faces: FreeType/msdfgen objects are not shared across threads.
+    // Plain SDFs come from a FreeType face at the cell's render size ...
+    FT_Library ftLib = nullptr;
+    FT_Face ftFace = nullptr;
+    if (FT_Init_FreeType(&ftLib) == 0 && FT_New_Memory_Face(ftLib, st->data, st->size, 0, &ftFace) == 0) {
+        if (FT_Set_Pixel_Sizes(ftFace, MSDF::SDF_RENDER_SIZE, MSDF::SDF_RENDER_SIZE) != 0) {
+            FT_Done_Face(ftFace);
+            ftFace = nullptr;
+        }
+    }
+    // ... and the msdfgen font is only opened when an MSDF is needed (refinement, or SDF failure).
+    msdfgen::FreetypeHandle* mft = nullptr;
+    msdfgen::FontHandle* mfont = nullptr;
+    auto msdfFont = [&]() -> msdfgen::FontHandle* {
+        if (!mfont) {
+            mft = msdfgen::initializeFreetype();
+            if (mft) mfont = msdfgen::loadFontData(mft, st->data, st->size);
+        }
+        return mfont;
+    };
 
     for (;;) {
         GenJob job;
         {
             std::unique_lock<std::mutex> lk(st->mtx);
-            st->cv.wait(lk, [&] { return st->stop || !st->jobs.empty(); });
+            st->cv.wait(lk, [&] { return st->stop || !st->jobs.empty() || !st->refineJobs.empty(); });
             if (st->stop) break;
-            job = st->jobs.front();
-            st->jobs.pop_front();
+            // New glyphs come first; refinements only when nothing else is waiting.
+            std::deque<GenJob>& from = !st->jobs.empty() ? st->jobs : st->refineJobs;
+            job = from.front();
+            from.pop_front();
         }
 
         LARGE_INTEGER t0, t1, fq;
         QueryPerformanceCounter(&t0);
         GenResult res;
         res.job = job;
-        res.ok = GenerateMSDFWith(font, res.pixels, job.codepoint, job.sdfW, job.sdfH);
+
+        if (!job.refine && ftFace) {
+            const FT_UInt gi = FT_Get_Char_Index(ftFace, job.codepoint);
+            if (FT_Load_Glyph(ftFace, gi, FT_LOAD_NO_BITMAP | FT_LOAD_NO_HINTING) == 0 &&
+                ftFace->glyph->format == FT_GLYPH_FORMAT_OUTLINE && ftFace->glyph->outline.n_contours > 0 &&
+                GenerateSDF(ftFace->glyph, res.pixels, job.sdfW, job.sdfH)) {
+                res.ok = true;
+                res.msdf = false;
+            }
+        }
+        if (!res.ok) {
+            res.pixels.clear();
+            res.ok = GenerateMSDFWith(msdfFont(), res.pixels, job.codepoint, job.sdfW, job.sdfH);
+            res.msdf = true;
+        }
+
         QueryPerformanceCounter(&t1);
         QueryPerformanceFrequency(&fq);
         res.ms = (t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(fq.QuadPart);
@@ -460,8 +510,83 @@ void MSDFFont::GenWorkerMain(std::shared_ptr<GenState> st) {
         }
     }
 
-    if (font) msdfgen::destroyFont(font);
-    if (ft) msdfgen::deinitializeFreetype(ft);
+    if (mfont) msdfgen::destroyFont(mfont);
+    if (mft) msdfgen::deinitializeFreetype(mft);
+    if (ftFace) FT_Done_Face(ftFace);
+    if (ftLib) FT_Done_FreeType(ftLib);
+}
+
+void MSDFFont::RequestRefinement(uint32_t codepoint) {
+    if (!m_asyncGen) return;
+    if (m_refineInflight.count(codepoint) || m_refineFailed.count(codepoint)) return;
+    auto it = m_glyphPool.find(codepoint);
+    if (it == m_glyphPool.end() || it->second.msdf || it->second.width == 0 || it->second.height == 0) return;
+
+    StartGenWorkers();
+    if (m_genThreads.empty()) return;
+
+    GenJob job;
+    job.codepoint = codepoint;
+    job.sdfW = it->second.width;
+    job.sdfH = it->second.height;
+    job.bitmapLeft = it->second.bitmapLeft;
+    job.bitmapTop = it->second.bitmapTop;
+    job.refine = true;
+    {
+        std::lock_guard<std::mutex> lk(m_gen->mtx);
+        m_gen->refineJobs.push_back(job);
+    }
+    m_gen->cv.notify_one();
+    m_refineInflight.insert(codepoint);
+}
+
+void MSDFFont::ApplyRefinement(GenResult& r) {
+    const uint32_t cp = r.job.codepoint;
+    m_refineInflight.erase(cp);
+    if (!r.ok || r.pixels.empty()) {
+        m_refineFailed.insert(cp);
+        return;
+    }
+
+    // Overwrite the cell in place when the glyph is still in the atlas with the same size: same UVs, so no
+    // string has to be rebuilt.
+    auto it = m_glyphPool.find(cp);
+    if (it != m_glyphPool.end()) {
+        GlyphMetrics& g = it->second;
+        if (g.width == r.job.sdfW && g.height == r.job.sdfH && g.atlasTile != 0xFF &&
+            g.atlasPageIndex < m_atlasPages.size() && m_atlasPages[g.atlasPageIndex]->texture) {
+            const LONG x = static_cast<LONG>(std::lround(g.u0 * MSDF::ATLAS_SIZE));
+            const LONG y = static_cast<LONG>(std::lround(g.v0 * MSDF::ATLAS_SIZE));
+            RECT rc = { x, y, x + r.job.sdfW, y + r.job.sdfH };
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(m_atlasPages[g.atlasPageIndex]->texture->LockRect(0, &lr, &rc, 0))) {
+                if (lr.Pitch >= r.job.sdfW * 4) {
+                    auto* dst = static_cast<unsigned char*>(lr.pBits);
+                    const unsigned char* src = r.pixels.data();
+                    for (int row = 0; row < r.job.sdfH; ++row, dst += lr.Pitch, src += r.job.sdfW * 4) {
+                        memcpy(dst, src, static_cast<size_t>(r.job.sdfW) * 4);
+                    }
+                    g.msdf = true;
+                }
+                m_atlasPages[g.atlasPageIndex]->texture->UnlockRect(0);
+            }
+        }
+    }
+
+    // The disk cache gets the MSDF too, replacing the SDF stored earlier.
+    GlyphMetricsToStore st;
+    st.codepoint = cp;
+    st.width = static_cast<uint16_t>(r.job.sdfW);
+    st.height = static_cast<uint16_t>(r.job.sdfH);
+    st.bitmapLeft = r.job.bitmapLeft;
+    st.bitmapTop = r.job.bitmapTop;
+    st.ownedPixelData = std::move(r.pixels);
+    st.dataSize = static_cast<uint32_t>(st.ownedPixelData.size());
+    st.msdf = true;
+    m_cache->StoreGlyph(std::move(st));
+
+    static int s_logged = 0;
+    if (s_logged < 20) { ++s_logged; Log("[MSDF] refined U+%04X from SDF to MSDF in place (%.1f ms on a worker)", cp, r.ms); }
 }
 
 MSDFFont::AtlasPage* MSDFFont::GetAtlasPage(size_t index) const {
@@ -625,6 +750,141 @@ bool MSDFFont::GenerateMSDFWith(msdfgen::FontHandle* font, std::vector<uint8_t>&
     m_msdfPool.Release(std::move(msdfBuf));
     m_msdfPool.Release(std::move(sdfBuf));
 
+    return true;
+}
+
+namespace {
+    constexpr float EDT_INF = 1e20f;
+
+    // One line of the exact squared Euclidean distance transform (Felzenszwalb &
+    // Huttenlocher): the lower envelope of parabolas rooted at every sample.
+    void DistanceTransform1D(float* grid, int offset, int stride, int length, float* f, float* z, int* v) {
+        v[0] = 0;
+        z[0] = -EDT_INF;
+        z[1] = EDT_INF;
+        f[0] = grid[offset];
+        for (int q = 1, k = 0; q < length; ++q) {
+            f[q] = grid[offset + q * stride];
+            const float q2 = static_cast<float>(q) * q;
+            float s;
+            do {
+                const int r = v[k];
+                s = (f[q] - f[r] + q2 - static_cast<float>(r) * r) / static_cast<float>(q - r) / 2.0f;
+            } while (s <= z[k] && --k > -1);
+            ++k;
+            v[k] = q;
+            z[k] = s;
+            z[k + 1] = EDT_INF;
+        }
+        for (int q = 0, k = 0; q < length; ++q) {
+            while (z[k + 1] < q) ++k;
+            const int r = v[k];
+            const float qr = static_cast<float>(q - r);
+            grid[offset + q * stride] = f[r] + qr * qr;
+        }
+    }
+
+    void DistanceTransform2D(float* grid, int w, int h, float* f, float* z, int* v) {
+        for (int x = 0; x < w; ++x) DistanceTransform1D(grid, x, w, h, f, z, v);
+        for (int y = 0; y < h; ++y) DistanceTransform1D(grid, y * w, 1, w, f, z, v);
+    }
+}
+
+// [1.12] The glyph as a plain SDF, from FreeType's anti-aliased coverage and an exact
+// distance transform - the method of Mapbox's TinySDF, which exists for the same
+// reason: CJK glyphs are too many and too complex to wait for exact curve distances.
+//
+// GenerateMSDF measures the distance from every texel to every edge of the outline,
+// twice (MSDF + the outline channel). On the font of issue #4 (FZBWJW, 96 px) that is
+// 31 ms per hanzi, 43 ms on msyh, ~10 ms per Latin letter - and until a worker had
+// made it the glyph was not drawn, so a screen of new Chinese text filled in over
+// seconds. This is 0.27 ms per hanzi, 0.14-0.26 ms per Latin letter.
+//
+// Measured against the true outline (pixels where the shader's reconstruction differs
+// from the nonzero fill, per glyph, 100 hanzi / 62 Latin, docs/cjk-atlas-duplication.md):
+// as faithful as the MSDF at every height up to SDF_RENDER_SIZE - 1.99 vs 2.01 at
+// 12 px, 6.2 vs 7.5 at 48 px for CJK, Latin within about a pixel - and the outline
+// channel agrees to 0.2-0.3% of its pixels at 12 px. Above ~1.5x SDF_RENDER_SIZE the
+// SDF rounds sharp corners, which is what the MSDF is for - that case is refined
+// (MSDF_ABOVE_SCALE).
+//
+// Same cell, same projection as GenerateMSDF (the outline's bounds scaled to fit
+// sdfW x sdfH minus the spread, bottom-left at (spread, spread), row 0 at the bottom),
+// same encoding (0.5 on the edge, spread px across RGB, 5x that in alpha), so the two
+// are interchangeable in the atlas, in the cache and in the shader: RGB are equal
+// here, and the median of three equal values is that value.
+//
+// Transforms slot->outline in place.
+bool MSDFFont::GenerateSDF(FT_GlyphSlot slot, std::vector<uint8_t>& outData, int sdfW, int sdfH) {
+    if (!slot || sdfW <= 0 || sdfH <= 0 || sdfW > 512 || sdfH > 512) return false;
+    if (slot->format != FT_GLYPH_FORMAT_OUTLINE) return false;
+
+    FT_Outline& outline = slot->outline;
+    FT_BBox bbox;
+    FT_Outline_Get_BBox(&outline, &bbox);
+    const double shapeW = (bbox.xMax - bbox.xMin) / 64.0;
+    const double shapeH = (bbox.yMax - bbox.yMin) / 64.0;
+    if (shapeW <= 0 || shapeH <= 0) return false;
+
+    const double usableW = static_cast<double>(sdfW) - 2.0 * MSDF::SDF_SPREAD;
+    const double usableH = static_cast<double>(sdfH) - 2.0 * MSDF::SDF_SPREAD;
+    if (usableW <= 0 || usableH <= 0) return false;
+
+    const FT_Fixed scale = static_cast<FT_Fixed>(std::lround(std::min(usableW / shapeW, usableH / shapeH) * 65536.0));
+    const FT_Matrix matrix = { scale, 0, 0, scale };
+    FT_Outline_Translate(&outline, -bbox.xMin, -bbox.yMin);
+    FT_Outline_Transform(&outline, &matrix);
+    FT_Outline_Translate(&outline, MSDF::SDF_SPREAD * 64, MSDF::SDF_SPREAD * 64);
+
+    const size_t count = static_cast<size_t>(sdfW) * sdfH;
+    thread_local std::vector<uint8_t> coverage;
+    coverage.assign(count, 0);
+    FT_Bitmap bitmap{};
+    bitmap.rows = static_cast<unsigned>(sdfH);
+    bitmap.width = static_cast<unsigned>(sdfW);
+    bitmap.pitch = sdfW;
+    bitmap.buffer = coverage.data();
+    bitmap.num_grays = 256;
+    bitmap.pixel_mode = FT_PIXEL_MODE_GRAY;
+    if (FT_Outline_Get_Bitmap(slot->library, &outline, &bitmap) != 0) return false;
+
+    // Squared distances to the nearest texel inside (for texels outside) and outside
+    // (for texels inside). A partly covered texel seeds both at the offset its
+    // coverage implies - (0.5 - a) px from the edge, TinySDF's rule.
+    thread_local std::vector<float> outer, inner, f, z;
+    thread_local std::vector<int> v;
+    outer.resize(count);
+    inner.resize(count);
+    const int longest = std::max(sdfW, sdfH);
+    f.resize(longest);
+    z.resize(longest + 1);
+    v.resize(longest);
+    for (size_t i = 0; i < count; ++i) {
+        const float a = coverage[i] / 255.0f;
+        if (a == 0.0f) { outer[i] = EDT_INF; inner[i] = 0.0f; }
+        else if (a == 1.0f) { outer[i] = 0.0f; inner[i] = EDT_INF; }
+        else {
+            const float d = 0.5f - a;
+            outer[i] = d > 0.0f ? d * d : 0.0f;
+            inner[i] = d < 0.0f ? d * d : 0.0f;
+        }
+    }
+    DistanceTransform2D(outer.data(), sdfW, sdfH, f.data(), z.data(), v.data());
+    DistanceTransform2D(inner.data(), sdfW, sdfH, f.data(), z.data(), v.data());
+
+    outData.resize(count * 4);
+    uint8_t* dest = outData.data();
+    constexpr float spread = static_cast<float>(MSDF::SDF_SPREAD);
+    for (int y = 0; y < sdfH; ++y) {
+        // FreeType's row 0 is the top one.
+        const size_t src = static_cast<size_t>(sdfH - 1 - y) * sdfW;
+        for (int x = 0; x < sdfW; ++x, dest += 4) {
+            const float distance = std::sqrt(outer[src + x]) - std::sqrt(inner[src + x]);  // > 0 outside
+            const uint8_t sd = static_cast<uint8_t>(std::clamp((0.5f - distance / spread) * 255.f, 0.f, 255.f));
+            dest[0] = dest[1] = dest[2] = sd;
+            dest[3] = static_cast<uint8_t>(std::clamp((0.5f - distance / (5.0f * spread)) * 255.f, 0.f, 255.f));
+        }
+    }
     return true;
 }
 

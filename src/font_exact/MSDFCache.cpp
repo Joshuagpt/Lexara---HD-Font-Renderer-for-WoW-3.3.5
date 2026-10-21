@@ -425,7 +425,8 @@ bool MSDFCache::WriteBlockFile(uint32_t blockId, std::vector<GlyphMetricsToStore
             	.bitmapTop = p->bitmapTop,
             	.bitmapLeft = p->bitmapLeft,
             	.dataOffset = 0,
-            	.dataSize = p->dataSize });
+            	.dataSize = p->dataSize,
+            	.flags = static_cast<uint8_t>(p->msdf ? 0 : GLYPH_FLAG_SDF_ONLY) });
         }
         else {
             auto* p = *pendingIt++;
@@ -436,7 +437,8 @@ bool MSDFCache::WriteBlockFile(uint32_t blockId, std::vector<GlyphMetricsToStore
                 .bitmapTop = p->bitmapTop,
                 .bitmapLeft = p->bitmapLeft,
                 .dataOffset = 0,
-                .dataSize = p->dataSize });
+                .dataSize = p->dataSize,
+                .flags = static_cast<uint8_t>(p->msdf ? 0 : GLYPH_FLAG_SDF_ONLY) });
             oldIdx++;
         }
     }
@@ -805,6 +807,7 @@ bool MSDFCache::ExecuteJob(AsyncJob& job, std::vector<ManifestEntry>& outEntries
             ge.bitmapLeft = p->bitmapLeft;
             ge.dataOffset = 0;
             ge.dataSize = p->dataSize;
+            ge.flags = static_cast<uint8_t>(p->msdf ? 0 : GLYPH_FLAG_SDF_ONLY);
             merged.push_back(ge);
             srcs.push_back({ p->dataSize > 0 ? p->ownedPixelData.data() : nullptr });
         }
