@@ -107,6 +107,7 @@ private:
     bool TryLoadGlyph(uint32_t codepoint, GlyphMetrics& outMetrics);
     bool StoreGlyph(GlyphMetricsToStore&& metrics);
     size_t GetManifestSize();
+    size_t CollectCachedCodepoints(std::vector<uint32_t>& out, size_t maxCount, size_t& inoutIndex);
 
     using ManifestMap = ankerl::unordered_dense::map<uint32_t, ManifestEntry>;
 

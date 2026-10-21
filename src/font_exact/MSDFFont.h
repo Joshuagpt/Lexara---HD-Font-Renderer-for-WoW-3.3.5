@@ -65,7 +65,8 @@ public:
     size_t GetAtlasPageCount() const { return m_atlasPages.size(); }
     size_t GetAtlasEvictionCount() const { return m_evictionCount; }
 
-    const GlyphMetrics* GetGlyph(uint32_t codepoint);
+    // preferSync=true: generate on the render thread (used for 3D nameplates so text does not wait on workers).
+    const GlyphMetrics* GetGlyph(uint32_t codepoint, bool preferSync = false);
 
     static MSDFFont* Get(FT_Face face);
     static void Register(FT_Face face, const FT_Byte* data, FT_Long size);
@@ -75,6 +76,7 @@ public:
 
     // Call at the start of each font batch: runs atlas evictions deferred from the previous batch.
     static void FlushPendingEvictions();
+    static void StepDiskWarmup();
 
     // True if atlas pages are created with auto-generated mipmaps.
     static bool IsAutoMipEnabled() { return s_autoMip; }
@@ -123,6 +125,8 @@ private:
     bool m_evictionPending = false; // atlas full: eviction is deferred to the start of the next batch
 
     std::unique_ptr<MSDFCache> m_cache;
+    size_t m_warmupIndex = 0;
+    bool m_warmupDone = false;
     std::vector<std::unique_ptr<AtlasPage>> m_atlasPages;
 
     ankerl::unordered_dense::map<uint32_t, GlyphMetrics> m_glyphPool;

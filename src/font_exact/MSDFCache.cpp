@@ -311,6 +311,25 @@ size_t MSDFCache::GetManifestSize() {
     return m_manifest.size();
 }
 
+size_t MSDFCache::CollectCachedCodepoints(std::vector<uint32_t>& out, size_t maxCount, size_t& inoutIndex) {
+    if (maxCount == 0) return 0;
+    if (!m_manifestLoaded) LoadManifest();
+    if (!m_manifestLoaded || m_manifest.empty()) return 0;
+
+    size_t seen = 0;
+    size_t added = 0;
+    for (const auto& kv : m_manifest) {
+        if (seen < inoutIndex) { ++seen; continue; }
+        out.push_back(kv.first);
+        ++seen;
+        ++added;
+        if (added >= maxCount) break;
+    }
+    inoutIndex = seen;
+    return added;
+}
+
+
 bool MSDFCache::FlushPendingWrites() {
     if (m_pendingWrites.empty()) return true;
     if (m_async) return FlushPendingWritesAsync();
