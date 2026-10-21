@@ -1,3 +1,4 @@
+#include <cmath>
 #include "../Logger.h"
 #include "MSDF.h"
 #include "MSDFFont.h"
@@ -25,15 +26,69 @@ namespace {
     bool s_diagZSaved = false;
     DWORD s_diagSavedZ = TRUE;
 
+    int s_dumpStrings = 0;  // remaining 3D strings to dump (armed by Ctrl+Shift+F8)
+    int s_dumpDraws = 0;    // remaining 3D font draws to dump
+
+    // Dumps the vertices exactly as the client just wrote them for the GPU. Layout assumed (same as the 1.12
+    // dump in the sibling project): 24 bytes per vertex = pos(3 floats), colour(uint32), u, v.
+    void DumpWritten3D(CGxString* s, int destPtr, int vertIndex, int vertCount) {
+        if (s_dumpStrings <= 0 || !destPtr || vertCount <= 0 || vertCount > 512) return;
+        --s_dumpStrings;
+        const uint8_t* d = reinterpret_cast<const uint8_t*>(destPtr);
+        auto vf = [&](int i) { return reinterpret_cast<const float*>(d + static_cast<size_t>(i) * 24); };
+        auto okf = [](float f) { return f == f && f > -1e9f && f < 1e9f; };
+
+        int quads = vertCount / 4, badUV = 0, degenerate = 0, badPos = 0;
+        for (int q = 0; q < quads; ++q) {
+            const float* a = vf(q * 4 + 0);
+            const float* c = vf(q * 4 + 3);
+            if (!(okf(a[4]) && okf(a[5]) && okf(c[4]) && okf(c[5])) ||
+                std::fabs(a[4]) > 1.0f || std::fabs(a[5]) > 1.0f || std::fabs(c[4]) > 1.0f || std::fabs(c[5]) > 1.0f) ++badUV;
+            if (!(okf(a[0]) && okf(a[1]) && okf(a[2]) && okf(c[0]) && okf(c[1]) && okf(c[2]))) ++badPos;
+            const float dx = c[0] - a[0], dy = c[1] - a[1], dz = c[2] - a[2];
+            if (dx * dx + dy * dy + dz * dz < 1e-10f) ++degenerate;
+        }
+        Log("[DUMP] 3D string text='%s' flags=%08X vertIndex=%d vertCount=%d quads=%d  badUV=%d degenerate=%d badPos=%d",
+            s->m_text ? s->m_text : "", s->m_flags, vertIndex, vertCount, quads, badUV, degenerate, badPos);
+        for (int q = 0; q < quads && q < 14; ++q) {
+            const float* a = vf(q * 4 + 0);
+            const float* c = vf(q * 4 + 3);
+            Log("[DUMP]    q%-2d v0=(%.3f %.3f %.3f) v3=(%.3f %.3f %.3f) uv0=(%.5f %.5f) uv3=(%.5f %.5f) col=%08X",
+                q, a[0], a[1], a[2], c[0], c[1], c[2], a[4], a[5], c[4], c[5],
+                *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(a) + 12));
+        }
+    }
+
     void DiagPollKeys() {
-        static bool d9 = false, d10 = false;
+        static bool d9 = false, d10 = false, d8 = false;
         const bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
         const bool k9 = mods && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
         const bool k10 = mods && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
         if (k9 && !d9) { s_diagNoMip = !s_diagNoMip; Log("[DIAG] F9: noMip = %d", s_diagNoMip ? 1 : 0); }
         if (k10 && !d10) { s_diagNoZWrite = !s_diagNoZWrite; Log("[DIAG] F10: noZWrite = %d", s_diagNoZWrite ? 1 : 0); }
         d9 = k9; d10 = k10;
+
+        // Ctrl+Shift+F8: dump what is actually sent to the GPU for the 3D strings of the next frame(s).
+        // Press it while a name is visibly missing characters, then compare it with a name that looks fine.
+        const bool k8 = mods && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (k8 && !d8) {
+            s_dumpStrings = 40;
+            s_dumpDraws = 8;
+            Log("[DUMP] ---- F8 pressed: dumping up to %d 3D strings and %d draws ----", s_dumpStrings, s_dumpDraws);
+        }
+        d8 = k8;
     }
+
+    // Rate-limited diagnostics. The old "first N lines" counters were used up on the login screen
+    // (300 "waiting for glyphs" lines in 9 s), so nothing was left for in-game 3D name text.
+    bool LogEvery(ULONGLONG& last, ULONGLONG intervalMs) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - last < intervalMs) return false;
+        last = now;
+        return true;
+    }
+    uint32_t s_stat2dWaiting = 0, s_stat3dWaiting = 0, s_stat2dStamped = 0, s_stat3dStamped = 0;
+    uint32_t s_statStale = 0, s_statStampedBad = 0;
 
     IDirect3DPixelShader9* s_cachedPS = nullptr;
     IDirect3DVertexShader9* s_cachedVS = nullptr;
@@ -103,6 +158,7 @@ namespace {
     // Called from the asm hook: run evictions deferred from the previous batch before validating strings
     void __cdecl FlushFontEvictions() {
         MSDFFont::FlushPendingEvictions();
+        MSDFFont::StepDiskWarmup();
     }
 
     void __cdecl PrefetchCodepoints(CGxString* pThis) {
@@ -138,6 +194,7 @@ namespace {
                         if (b->m_verts.m_data[q].u > 1.0f) ++bad;
                     }
                     static int s_n = 0;
+                    if (bad) ++s_statStampedBad;
                     if (bad && s_n < 100) {
                         ++s_n;
                         Log("[DIAG] STAMPED string has %u/%u unprocessed quads, is3d=%d, flags=%08X, text='%s'",
@@ -175,7 +232,9 @@ namespace {
             if (vBase[0].u > 1.0f) {
                 const uint32_t codepoint = vBase[0].u - 1.0f;
 
-                const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint);
+                // 3D nameplates generate missing glyphs on the render thread so mid-name characters
+                // (e.g. 世界 in 旧世界武器军需官) do not stay blank for many frames waiting on workers.
+                const GlyphMetrics* gm = fontHandle->GetGlyph(codepoint, /*preferSync=*/is3d);
                 if (!gm) { incomplete = true; if (!missingCp) { missingCp = codepoint; missingWhy = 1; } continue; }
 
                 CGxGlyphCacheEntry* entry = fontObj->GetOrCreateGlyphEntry(codepoint);
@@ -228,18 +287,28 @@ namespace {
 
         // Some glyphs unavailable: keep the pending bit and do not stamp; retried next frame.
         if (incomplete) {
-            // Diagnostics for "missing characters": how often does a string have to wait for glyphs?
-            static int s_incompleteLogged = 0;
-            if (s_incompleteLogged < 300) {
-                ++s_incompleteLogged;
-                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d text='%s' (#%d)",
-                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy,
-                    pThis->m_text ? pThis->m_text : "", s_incompleteLogged);
+            // Diagnostics for "missing characters": rate-limited per kind (3D and 2D separately), no fixed cap.
+            if (is3d) ++s_stat3dWaiting; else ++s_stat2dWaiting;
+            static ULONGLONG s_last2d = 0, s_last3d = 0;
+            // 3D: 100ms so short-lived nameplate misses are more likely to appear in the log
+            if (LogEvery(is3d ? s_last3d : s_last2d, is3d ? 100 : 3000)) {
+                Log("[MSDF] string waiting for glyphs: is3d=%d quads=%u firstMissing=U+%04X why=%d preferSync=%d text='%s'",
+                    is3d ? 1 : 0, verts.m_count / 4, missingCp, missingWhy, is3d ? 1 : 0,
+                    pThis->m_text ? pThis->m_text : "");
             }
             return;
         }
 
         // Stamp = processed. Validity is tracked by MSDFFont (tile mask + eviction log), not by the token.
+        if (is3d) {
+            ++s_stat3dStamped;
+            static ULONGLONG s_lastStamp3d = 0;
+            if (LogEvery(s_lastStamp3d, 250)) {
+                Log("[MSDF] 3D string stamped: quads=%u text='%s'", verts.m_count / 4, pThis->m_text ? pThis->m_text : "");
+            }
+        } else {
+            ++s_stat2dStamped;
+        }
         pThis->m_flags = (pThis->m_flags & 0x00FFFFFF) | (0x80u << 24);
     }
 
@@ -249,6 +318,7 @@ namespace {
             // Stale = a tile this string uses has been evicted since it was built: rebuild it.
             // Strings that use only surviving tiles stay valid and are not rebuilt.
             if (fontHandle->CheckString(pThis, stamped) == MSDFFont::StringState::Stale) {
+                ++s_statStale;
                 static int s_staleLogged = 0;
                 if (s_staleLogged < 100) {
                     ++s_staleLogged;
@@ -309,11 +379,25 @@ namespace {
         device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
         device->SetVertexShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
 
-        s_text3dActive = is3d; // the draw callback (registered in FreeType_InitHk) acts on this
+        if (is3d) s_text3dActive = true; // OR over the whole batch; reset in CGxuFontRenderBatchHk
+        if (is3d && s_dumpStrings > 0) {
+            Log("[DUMP] control written for this string: (%.2f %.2f %.2f %.0f)  fontSizeMult=%.3f rasterTarget=%.2f",
+                controlFlag[0], controlFlag[1], controlFlag[2], controlFlag[3],
+                pThis->m_fontSizeMult, pThis->m_fontObj->m_rasterTargetSize);
+            DumpWritten3D(pThis, destPtr, vertIndex, vertCount);
+        }
     }
 
     void __fastcall CGxuFontRenderBatchHk(CGxuFont* pThis) {
         DiagPollKeys();
+        {
+            static ULONGLONG s_lastStat = 0;
+            if (LogEvery(s_lastStat, 2000) && (s_stat2dWaiting | s_stat3dWaiting | s_stat2dStamped | s_stat3dStamped | s_statStale | s_statStampedBad)) {
+                Log("[STAT] 2s: waiting 2d=%u 3d=%u | stamped 2d=%u 3d=%u | stale-rebuild=%u | stamped-with-unprocessed=%u",
+                    s_stat2dWaiting, s_stat3dWaiting, s_stat2dStamped, s_stat3dStamped, s_statStale, s_statStampedBad);
+                s_stat2dWaiting = s_stat3dWaiting = s_stat2dStamped = s_stat3dStamped = s_statStale = s_statStampedBad = 0;
+            }
+        }
         pThis->RenderBatch();
         s_text3dActive = false;
         if (s_diagZSaved) {
@@ -555,6 +639,41 @@ namespace {
         return 1;
     }
 
+    // 3D text depth fix. MUST be registered from MSDF::initialize() (i.e. at DLL attach, before the
+    // device exists): D3D.cpp only detours DrawIndexedPrimitive in CGxDevice::DeviceCreate if somebody
+    // is already listening at that moment. Registering from FreeType_InitHk can be too late, and then
+    // this callback never runs (the Ctrl+Shift+F10 toggle would change nothing).
+    void RegisterText3DDepthHook() {
+        static bool s_done = false;
+        if (s_done) return;
+        s_done = true;
+        D3D::RegisterDrawIndexedPrimitiveCallback([](IDirect3DDevice9* dev, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) {
+            if (!s_text3dActive) return;
+            if (s_dumpDraws > 0) {
+                --s_dumpDraws;
+                float ctl[4] = {};
+                dev->GetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, ctl, 1);
+                DWORD zen = 0, zw = 0, cull = 0, blend = 0, atest = 0, zfunc = 0;
+                dev->GetRenderState(D3DRS_ZENABLE, &zen); dev->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
+                dev->GetRenderState(D3DRS_ZFUNC, &zfunc); dev->GetRenderState(D3DRS_CULLMODE, &cull);
+                dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend); dev->GetRenderState(D3DRS_ALPHATESTENABLE, &atest);
+                IDirect3DBaseTexture9* t[4] = {};
+                for (int i = 0; i < 4; ++i) dev->GetTexture((15 - MSDF::MAX_ATLAS_PAGES + 1) + i, &t[i]);
+                Log("[DUMP] 3D font draw: ctl_ps=(%.2f %.2f %.2f %.0f) ZENABLE=%lu ZFUNC=%lu ZWRITE(before our override)=%lu CULL=%lu BLEND=%lu ATEST=%lu tex[%p %p %p %p]",
+                    ctl[0], ctl[1], ctl[2], ctl[3], zen, zfunc, zw, cull, blend, atest, t[0], t[1], t[2], t[3]);
+                for (int i = 0; i < 4; ++i) if (t[i]) t[i]->Release();
+            }
+            static bool s_loggedFirst = false;
+            if (!s_loggedFirst) { s_loggedFirst = true; Log("[DIAG] DIP hook: first 3D text draw seen (noZWrite=%d)", s_diagNoZWrite ? 1 : 0); }
+            if (!s_diagNoZWrite) return;
+            if (!s_diagZSaved) {
+                dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZ);
+                s_diagZSaved = true;
+            }
+            dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        });
+    }
+
     int __cdecl FreeType_InitHk(void* memory, FT_Library* alibrary) {
         if (!MSDF::INITIALIZED) {
             std::string localeStr = MSDF::GetGameLocale();
@@ -603,15 +722,6 @@ namespace {
             Hooks::Detour(&CGxString::WriteGeometryFn, CGxString__WriteGeometryHk);
             Hooks::Detour(&CGxString::InitializeTextLineFn, CGxString__InitializeTextLineHk);
             DetourTransactionCommit();
-
-            D3D::RegisterDrawIndexedPrimitiveCallback([](IDirect3DDevice9* dev, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) {
-                if (!s_text3dActive || !s_diagNoZWrite) return;
-                if (!s_diagZSaved) {
-                    dev->GetRenderState(D3DRS_ZWRITEENABLE, &s_diagSavedZ);
-                    s_diagZSaved = true;
-                }
-                dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-            });
 
             D3D::RegisterOnDestroy([]() {
                 if (s_cachedPS) { s_cachedPS->Release(); s_cachedPS = nullptr; }
@@ -696,6 +806,7 @@ void MSDF::initialize() {
         return;
     }
 
+    RegisterText3DDepthHook();
     Hooks::Detour(&FreeType::InitFn, FreeType_InitHk);
     s_msdfInitHookArmed = true;
 }
