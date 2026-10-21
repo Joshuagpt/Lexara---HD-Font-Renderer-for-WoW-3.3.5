@@ -26,6 +26,22 @@ namespace {
     bool s_diagZSaved = false;
     DWORD s_diagSavedZ = TRUE;
 
+    // ---- added: hotkeys (Ctrl+Shift held), 3D text only ----
+    //   F7 = depth TEST off      F6 = "safe AA" (mip 0 + screenPxRange >= 1)
+    //   F5 = paint whole glyph quads magenta      F4 = cull mode none
+    bool s_diagNoZTest = false, s_diagSafeAA = false, s_diagBoxes = false, s_diagNoCull = false;
+    bool s_diagZESaved = false, s_diagCullSaved = false;
+    DWORD s_diagSavedZE = TRUE, s_diagSavedCull = D3DCULL_CCW;
+
+    // [from lexara112] The client pushes its lazily cached state to the device between WriteGeometry (where we set
+    // c23, the atlas textures and, via the shader object, our shaders) and the draw itself. 1.12 lost its pixel
+    // shader and WORLD matrix that way and fixed it by re-asserting everything inside the DrawIndexedPrimitive hook.
+    // 3.3.5 did that for ZWRITE only. Everything below is re-asserted at the draw and every loss is counted/logged.
+    bool s_msdfBatchActive = false;
+    float s_lastControl[4] = {};
+    IDirect3DTexture9* s_lastTex[MSDF::MAX_ATLAS_PAGES] = {};
+    uint32_t s_syncConstLost = 0, s_syncShaderLost = 0, s_syncDraws = 0;
+
     int s_dumpStrings = 0;  // remaining 3D strings to dump (armed by Ctrl+Shift+F8)
     int s_dumpDraws = 0;    // remaining 3D font draws to dump
 
@@ -60,7 +76,7 @@ namespace {
     }
 
     void DiagPollKeys() {
-        static bool d9 = false, d10 = false, d8 = false;
+        static bool d9 = false, d10 = false, d8 = false, d7 = false, d6 = false, d5 = false, d4 = false;
         const bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
         const bool k9 = mods && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
         const bool k10 = mods && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -77,6 +93,12 @@ namespace {
             Log("[DUMP] ---- F8 pressed: dumping up to %d 3D strings and %d draws ----", s_dumpStrings, s_dumpDraws);
         }
         d8 = k8;
+
+        auto key = [&](int vk, bool& prev) { const bool k = mods && (GetAsyncKeyState(vk) & 0x8000) != 0; const bool edge = k && !prev; prev = k; return edge; };
+        if (key(VK_F7, d7)) { s_diagNoZTest = !s_diagNoZTest; Log("[DIAG] F7: noZTest(3D text) = %d", s_diagNoZTest ? 1 : 0); }
+        if (key(VK_F6, d6)) { s_diagSafeAA = !s_diagSafeAA; Log("[DIAG] F6: safeAA = %d", s_diagSafeAA ? 1 : 0); }
+        if (key(VK_F5, d5)) { s_diagBoxes = !s_diagBoxes; Log("[DIAG] F5: boxes = %d", s_diagBoxes ? 1 : 0); }
+        if (key(VK_F4, d4)) { s_diagNoCull = !s_diagNoCull; Log("[DIAG] F4: noCull(3D text) = %d", s_diagNoCull ? 1 : 0); }
     }
 
     // Rate-limited diagnostics. The old "first N lines" counters were used up on the login screen
@@ -359,10 +381,12 @@ namespace {
         IDirect3DDevice9* device = D3D::GetDevice();
         if (!device) return;
 
+        for (uint32_t i = 0; i < MSDF::MAX_ATLAS_PAGES; ++i) s_lastTex[i] = nullptr;
         for (uint32_t pageIdx = 0; pageIdx < fontHandle->GetAtlasPageCount(); ++pageIdx) {
             auto* atlasTexture = fontHandle->GetAtlasPage(pageIdx);
             if (atlasTexture && atlasTexture->texture) {
                 uint32_t slot = (15 - MSDF::MAX_ATLAS_PAGES + 1) + pageIdx;
+                if (pageIdx < MSDF::MAX_ATLAS_PAGES) s_lastTex[pageIdx] = atlasTexture->texture;
                 device->SetTexture(slot, atlasTexture->texture);
                 device->SetSamplerState(slot, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
                 device->SetSamplerState(slot, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
@@ -378,13 +402,17 @@ namespace {
 
         const uint32_t flags = pThis->m_fontObj->m_atlasPages[0].m_flags;
         const bool is3d = pThis->m_flags & 0x80;
+        // control.y of 3D text also carries debug bits: 10 * (boxes + 2 * safeAA); decoded in the pixel shader.
+        const float diagY = (s_diagBoxes ? 10.0f : 0.0f) + (s_diagSafeAA ? 20.0f : 0.0f);
         const float controlFlag[4] = {
             is3d ? pThis->m_fontObj->m_rasterTargetSize : static_cast<float>(CGxuFont::GetFontEffectiveHeight(is3d, pThis->m_fontSizeMult)),
-            is3d ? 0.0f : ((flags & 8) ? 2.0f : ((flags & 1) ? 1.0f : 0.0f)),
+            is3d ? diagY : ((flags & 8) ? 2.0f : ((flags & 1) ? 1.0f : 0.0f)),
             MSDF::SDF_SPREAD, MSDF::ATLAS_SIZE
         };
         device->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
         device->SetVertexShaderConstantF(MSDF::SDF_SAMPLER_SLOT, controlFlag, 1);
+        memcpy(s_lastControl, controlFlag, sizeof(s_lastControl));
+        s_msdfBatchActive = true;
 
         if (is3d) s_text3dActive = true; // OR over the whole batch; reset in CGxuFontRenderBatchHk
         if (is3d && s_dumpStrings > 0) {
@@ -406,7 +434,24 @@ namespace {
             }
         }
         pThis->RenderBatch();
+        {
+            static ULONGLONG s_lastSync = 0;
+            if (s_msdfBatchActive && LogEvery(s_lastSync, 2000)) {
+                Log("[SYNC] 2s: font draws=%u, c%u changed before draw=%u, shaders replaced=%u",
+                    s_syncDraws, MSDF::SDF_SAMPLER_SLOT, s_syncConstLost, s_syncShaderLost);
+                s_syncDraws = s_syncConstLost = s_syncShaderLost = 0;
+            }
+        }
+        s_msdfBatchActive = false;
         s_text3dActive = false;
+        if (s_diagCullSaved) {
+            if (IDirect3DDevice9* d = D3D::GetDevice()) d->SetRenderState(D3DRS_CULLMODE, s_diagSavedCull);
+            s_diagCullSaved = false;
+        }
+        if (s_diagZESaved) {
+            if (IDirect3DDevice9* d = D3D::GetDevice()) d->SetRenderState(D3DRS_ZENABLE, s_diagSavedZE);
+            s_diagZESaved = false;
+        }
         if (s_diagZSaved) {
             if (IDirect3DDevice9* d = D3D::GetDevice()) d->SetRenderState(D3DRS_ZWRITEENABLE, s_diagSavedZ);
             s_diagZSaved = false;
@@ -655,7 +700,50 @@ namespace {
         if (s_done) return;
         s_done = true;
         D3D::RegisterDrawIndexedPrimitiveCallback([](IDirect3DDevice9* dev, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) {
+            if (!s_msdfBatchActive) return;
+
+            // [from lexara112] re-assert our state at the draw and count how often it had been lost.
+            ++s_syncDraws;
+            {
+                float now[4] = {};
+                if (SUCCEEDED(dev->GetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, now, 1)) &&
+                    memcmp(now, s_lastControl, sizeof(now)) != 0) {
+                    ++s_syncConstLost;
+                    static int s_n = 0;
+                    if (s_n < 20) {
+                        ++s_n;
+                        Log("[SYNC] ps c%u changed before the draw (3d=%d): wrote %.2f %.2f %.2f %.0f, draw sees %.2f %.2f %.2f %.0f",
+                            MSDF::SDF_SAMPLER_SLOT, s_text3dActive ? 1 : 0,
+                            s_lastControl[0], s_lastControl[1], s_lastControl[2], s_lastControl[3], now[0], now[1], now[2], now[3]);
+                    }
+                }
+                IDirect3DPixelShader9* ps = nullptr; IDirect3DVertexShader9* vs = nullptr;
+                dev->GetPixelShader(&ps); dev->GetVertexShader(&vs);
+                if ((s_cachedPS && ps != s_cachedPS) || (s_cachedVS && vs != s_cachedVS)) {
+                    ++s_syncShaderLost;
+                    static int s_n2 = 0;
+                    if (s_n2 < 20) { ++s_n2; Log("[SYNC] shaders replaced before the draw (3d=%d): vs=%p ps=%p ours %p %p", s_text3dActive ? 1 : 0, vs, ps, s_cachedVS, s_cachedPS); }
+                    if (s_cachedVS) dev->SetVertexShader(s_cachedVS);
+                    if (s_cachedPS) dev->SetPixelShader(s_cachedPS);
+                }
+                if (ps) ps->Release();
+                if (vs) vs->Release();
+                dev->SetPixelShaderConstantF(MSDF::SDF_SAMPLER_SLOT, s_lastControl, 1);
+                dev->SetVertexShaderConstantF(MSDF::SDF_SAMPLER_SLOT, s_lastControl, 1);
+                for (uint32_t i = 0; i < MSDF::MAX_ATLAS_PAGES; ++i) {
+                    if (s_lastTex[i]) dev->SetTexture((15 - MSDF::MAX_ATLAS_PAGES + 1) + i, s_lastTex[i]);
+                }
+            }
+
             if (!s_text3dActive) return;
+            if (s_diagNoZTest) {
+                if (!s_diagZESaved) { dev->GetRenderState(D3DRS_ZENABLE, &s_diagSavedZE); s_diagZESaved = true; }
+                dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+            }
+            if (s_diagNoCull) {
+                if (!s_diagCullSaved) { dev->GetRenderState(D3DRS_CULLMODE, &s_diagSavedCull); s_diagCullSaved = true; }
+                dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            }
             if (s_dumpDraws > 0) {
                 --s_dumpDraws;
                 float ctl[4] = {};

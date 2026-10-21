@@ -61,7 +61,12 @@ inline auto* pixelShaderHLSL = R"(
 
 		float2 uv = IN.uv0;
 
-		float outlineHint = control.y;
+		// control.y = outline mode (0/1/2) + 10 * debug bits (3D text only, see MSDF.cpp hotkeys):
+		//   bit0 = paint the whole quad magenta, bit1 = "safe AA" (mip 0 + screenPxRange floor of 1)
+		float dbg = floor(control.y / 10.0f + 0.01f);
+		float outlineHint = control.y - dbg * 10.0f;
+		bool dbgBoxes = (dbg - 2.0f * floor(dbg / 2.0f)) > 0.5f;
+		bool dbgSafe = dbg > 1.5f;
 		float fontSize = control.x;
 		float outlinePx = 0.0f;
 
@@ -77,6 +82,7 @@ inline auto* pixelShaderHLSL = R"(
 		float footprint = max(fwidth(uv.x), fwidth(uv.y)) * control.a;
 		// use mips when minified to avoid shimmer; LOD capped at 2 (gutter is only ~10px, higher levels bleed into neighbours)
 		float lod = clamp(log2(max(footprint, 1.0f)) - 0.5f, 0.0f, 2.0f);
+		if (dbgSafe) lod = 0.0f;
 		float4 uvl = float4(uv, 0.0f, lod);
 
 		float4 sample;
@@ -87,7 +93,13 @@ inline auto* pixelShaderHLSL = R"(
 
 		float sd = median(sample.r, sample.g, sample.b);
 		float screenPxRange = (control.z / max(footprint, 1e-6)) * (1.0f - min(0.3f, fontSize * 0.0035f)); // smoother edges for larger text
+		if (dbgSafe) screenPxRange = max(screenPxRange, 1.0f);
 		float opacity = saturate((sd - 0.5f) * screenPxRange + 0.5f);
+
+		if (dbgBoxes) {
+			// DIAG: no clip -> the whole padded quad is visible; the glyph keeps its own colour on top.
+			return float4(lerp(float3(1.0f, 0.0f, 1.0f), IN.col.rgb, opacity), max(opacity, 0.45f));
+		}
 
 		float4 result;
 		if (outlinePx > 0.0f) {
