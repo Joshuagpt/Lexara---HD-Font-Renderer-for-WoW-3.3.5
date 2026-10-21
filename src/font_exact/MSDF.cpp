@@ -20,7 +20,7 @@ namespace {
     // Hotkeys for A/B comparison (Ctrl+Shift held, so they do not collide with game key bindings):
     //   Ctrl+Shift+F9  = toggle: sample atlas at mip level 0 only
     //   Ctrl+Shift+F10 = toggle: depth-write-off for 3D text (default ON)
-    bool s_diagNoMip = false;
+    bool s_diagNoMip = true;   // default: sample mip level 0 (brighter, sharper); Ctrl+Shift+F9 switches to trilinear mips
     bool s_diagNoZWrite = true;
     bool s_text3dActive = false;
     bool s_diagZSaved = false;
